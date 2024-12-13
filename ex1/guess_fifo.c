@@ -1,78 +1,147 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <time.h>
 #include <signal.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <locale.h>
 
-#define FIFO_GUESS "/tmp/fifo_guess"
-#define FIFO_RESULT "/tmp/fifo_result"
+// Флаг для обозначения, что число угадано
+volatile sig_atomic_t guessed = 0;
+// Указатель на загаданное число
+int *secret_number;
+// Количество попыток
+int *attempts;
 
-void cleanup() {
-    unlink(FIFO_GUESS);
-    unlink(FIFO_RESULT);
+void signal_handler(int signum) {
+    if (signum == SIGUSR1) {
+        guessed = 1;
+    }
 }
 
-int main() {
-    mkfifo(FIFO_GUESS, 0666);
-    mkfifo(FIFO_RESULT, 0666);
-    atexit(cleanup);  // Удалить файлы FIFO
+void player_one(int N) {
+    // Cоздает уникальное значение для инициализации генератора случайных чисел.
+    srand(time(NULL) + getpid()); 
 
-    pid_t child_pid = fork();
-    if (child_pid == 0) {
-    
-        srand(time(NULL) ^ getpid());
+    while (1) {
+        // Загадываем число
+        *secret_number = rand() % N + 1; 
+        printf("Игрок 1 загадал число от 1 до %d: %d\n", N, *secret_number);
 
-        int guess_pipe = open(FIFO_GUESS, O_WRONLY);
-        int result_pipe = open(FIFO_RESULT, O_RDONLY);
+        guessed = 0;
+        *attempts = 0;
 
-        while (1) {
-            int guess = rand() % 100 + 1;
-            printf("Процесс %d предполагает: %d\n", getpid(), guess);
-            write(guess_pipe, &guess, sizeof(int));
-
-            int result;
-            read(result_pipe, &result, sizeof(int));
-
-            if (result == 1) {
-                printf("Процесс %d угадал!\n", getpid());
-                break;
-            } else {
-                printf("Процесс %d не угадал. Продолжаю...\n", getpid());
-            }
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            exit(EXIT_FAILURE);
         }
 
-        close(guess_pipe);
-        close(result_pipe);
-    } else {
-        // Родительский процесс 
-        srand(time(NULL));
-        int secret_number = rand() % 100 + 1;
-        printf("Загадано число: %d\n", secret_number);
-
-        int guess_pipe = open(FIFO_GUESS, O_RDONLY);
-        int result_pipe = open(FIFO_RESULT, O_WRONLY);
-
-        while (1) {
+        if (pid == 0) {
+            // Дочерний процесс: игрок 2
             int guess;
-            read(guess_pipe, &guess, sizeof(int));
-            printf("Получено предположение: %d\n", guess);
+            while (1) {
+                (*attempts)++;
+                // Угадываем случайное число
+                guess = rand() % N + 1; 
+                printf("Игрок 2 предполагает: %d\n", guess);
 
-            int result = (guess == secret_number) ? 1 : 0;
-            write(result_pipe, &result, sizeof(int));
-
-            if (result == 1) {
-                printf("Число угадано! Начинается новая игра...\n");
-                secret_number = rand() % 100 + 1;
-                printf("Новое загаданное число: %d\n", secret_number);
+                if (guess == *secret_number) {
+                    printf("Игрок 2: Я угадал число за %d попыток!\n", *attempts);
+                    kill(getppid(), SIGUSR1);
+                    exit(EXIT_SUCCESS);
+                }
             }
+        } else {
+            // Родительский процесс: игрок 1
+            while (!guessed) {
+                // Ждём завершения процесса игрока 2
+                wait(NULL); 
+            }
+            printf("Игрок 1: Игрок 2 угадал число %d за %d попыток.\n", *secret_number, *attempts);
+            break;
+        }
+    }
+}
+
+void player_two(int N) {
+    srand(time(NULL) + getpid());
+
+    while (1) {
+        // Загадываем число
+        *secret_number = rand() % N + 1; 
+        printf("Игрок 2 загадал число от 1 до %d: %d\n", N, *secret_number);
+
+        guessed = 0;
+        *attempts = 0;
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            exit(EXIT_FAILURE);
         }
 
-        close(guess_pipe);
-        close(result_pipe);
+        if (pid == 0) {
+            // Дочерний процесс: игрок 1
+            int guess;
+            while (1) {
+                (*attempts)++;
+                // Угадываем случайное число
+                guess = rand() % N + 1; 
+                printf("Игрок 1 предполагает: %d\n", guess);
+
+                if (guess == *secret_number) {
+                    printf("Игрок 1: Я угадал число за %d попыток!\n", *attempts);
+                    kill(getppid(), SIGUSR1);
+                    exit(EXIT_SUCCESS);
+                }
+            }
+        } else {
+            // Родительский процесс: игрок 2
+            while (!guessed) {
+                // Ждём завершения процесса игрока 1
+                wait(NULL); 
+            }
+            printf("Игрок 2: Игрок 1 угадал число %d за %d попыток.\n", *secret_number, *attempts);
+            break;
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Использование: %s <N>\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
 
+    int N = atoi(argv[1]);
+    if (N <= 0) {
+        fprintf(stderr, "N должно быть положительным числом.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    setlocale(LC_ALL, "ru_RU");
+
+    // Создаем общую память для хранения загаданного числа и количества попыток
+    secret_number = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    attempts = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (secret_number == MAP_FAILED || attempts == MAP_FAILED) {
+        perror("mmap");
+        exit(EXIT_FAILURE);
+    }
+
+    signal(SIGUSR1, signal_handler);
+
+    while (1) {
+        printf("\n--- Игра между игроками 1 и 2 ---\n");
+        player_one(N);
+
+        printf("\n--- Игра между игроками 2 и 1 ---\n");
+        player_two(N);
+    }
+
+    munmap(secret_number, sizeof(int));
+    munmap(attempts, sizeof(int));
     return 0;
 }
